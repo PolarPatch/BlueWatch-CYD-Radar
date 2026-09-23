@@ -94,7 +94,9 @@ device count.*
    uncomment and set `upload_port`/`monitor_port` in `platformio.ini`.
 4. On first boot the screen shows "connecting to Wi-Fi..." and then the
    device count once it reaches BlueWatch (or "(local scan)" if it falls
-   back to standalone).
+   back to standalone). This is the device list. **Tap the BlueWatch logo,
+   top left, to open the radar** — there's no button for it, only the logo.
+   Tap "< Back", top left of the radar, to return to the list.
 
 If colours look inverted, the display is upside down, or touches land in the
 wrong place, adjust `TFT_INVERT`, `TFT_ROTATION`, the `TOUCH_*` flags and (on
