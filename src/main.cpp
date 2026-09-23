@@ -54,7 +54,7 @@ static const int HDR_LOGO_W = LOGO_SMALL_W, HDR_LOGO_H = LOGO_SMALL_H;
 #else
 static const int HDR_H = 62;
 static const int BTN_Y = 64;
-static const int BTN_H = 32;
+static const int BTN_H = 24;
 static const int LISTBOX_Y = 100;
 static const int DAREA_Y = 44;
 static const int RBAND_H = 40;
@@ -133,7 +133,7 @@ static volatile int rFront = 0;
 static volatile uint32_t rVersion = 0;
 static volatile bool radarWanted = false;
 
-static bool hideClassified = true, hideGrouped = true, hideUnknown = true;
+static bool hideClassified = true, hideGrouped = true, hideUnknown = true, hideListApple = false;
 static bool hideRadarClassified = false, hideRadarGrouped = false, hideRadarUnknown = false, hideRadarApple = false;
 static Preferences prefs;
 
@@ -238,6 +238,7 @@ static void buildListLocal() {
     const BleEntry& e = snap[i];
     bool unknown = e.name[0] == 0 && strcmp(e.type, "unknown") == 0;
     if (hideUnknown && unknown) continue;
+    if (hideListApple && e.isApple) continue;
     // hideClassified/hideGrouped have no local equivalent (no categories
     // without a server) -- both are no-ops in standalone mode.
     uint32_t ageSec = (now - e.lastSeenMs) / 1000;
@@ -311,6 +312,7 @@ static void fetchList() {
   if (hideClassified) url += "&hide_classified=1";
   if (hideGrouped) url += "&hide_grouped=1";
   if (hideUnknown) url += "&hide_nameless=1";
+  if (hideListApple) url += "&hide_apple=1";
   HTTPClient http;
   http.setTimeout(8000);
   http.begin(url);
@@ -637,8 +639,8 @@ static void drawHeader() {
   tft.drawString(line, 70, 38);
 }
 
-static const int LBTN_X0 = 42, LBTN_GAP = 4;
-static const int LBTN_W = (W - LBTN_X0 - 4 - 2 * LBTN_GAP) / 3;
+static const int LBTN_X0 = 34, LBTN_GAP = 3;
+static const int LBTN_W = (W - LBTN_X0 - 4 - 3 * LBTN_GAP) / 4;
 static void listBtnRect(int i, int* x, int* w) {
   *x = LBTN_X0 + i * (LBTN_W + LBTN_GAP);
   *w = LBTN_W;
@@ -646,15 +648,14 @@ static void listBtnRect(int i, int* x, int* w) {
 
 static void drawButtons() {
   tft.fillRect(0, BTN_Y, W, BTN_H + 4, C_BG);
-  tft.setFont(&fonts::Font2);
+  tft.setFont(&fonts::Font0);
   tft.setTextDatum(middle_center);
   tft.setTextColor(C_MUTED, C_BG);
   tft.setTextDatum(middle_left);
-  tft.drawString("Hide", 6, BTN_Y + BTN_H / 2);
-  const char* labels[3] = {"classified", "grouped", "unknowns"};
-  bool on[3] = {hideClassified, hideGrouped, hideUnknown};
-  if (W < 300) tft.setFont(&fonts::Font0);  // narrower board: the full words need a smaller font to fit
-  for (int i = 0; i < 3; i++) {
+  tft.drawString("Hide", 2, BTN_Y + BTN_H / 2);
+  const char* labels[4] = {"classified", "grouped", "unknowns", "Apple"};
+  bool on[4] = {hideClassified, hideGrouped, hideUnknown, hideListApple};
+  for (int i = 0; i < 4; i++) {
     int x, bw;
     listBtnRect(i, &x, &bw);
     if (on[i]) {
@@ -1023,6 +1024,7 @@ void setup() {
   hideClassified = prefs.getBool("hc", true);
   hideGrouped = prefs.getBool("hg", true);
   hideUnknown = prefs.getBool("hu", true);
+  hideListApple = prefs.getBool("hap", false);
   hideRadarClassified = prefs.getBool("rc", false);
   hideRadarGrouped = prefs.getBool("rg", false);
   hideRadarUnknown = prefs.getBool("ru", false);
@@ -1144,10 +1146,11 @@ void loop() {
       }
     } else if (startY >= BTN_Y && startY < BTN_Y + BTN_H) {
       int i = (startX - LBTN_X0) / (LBTN_W + LBTN_GAP);
-      if (startX >= LBTN_X0 && i >= 0 && i < 3 && (startX - LBTN_X0) % (LBTN_W + LBTN_GAP) < LBTN_W) {
+      if (startX >= LBTN_X0 && i >= 0 && i < 4 && (startX - LBTN_X0) % (LBTN_W + LBTN_GAP) < LBTN_W) {
         if (i == 0) { hideClassified = !hideClassified; prefs.putBool("hc", hideClassified); }
         if (i == 1) { hideGrouped = !hideGrouped; prefs.putBool("hg", hideGrouped); }
         if (i == 2) { hideUnknown = !hideUnknown; prefs.putBool("hu", hideUnknown); }
+        if (i == 3) { hideListApple = !hideListApple; prefs.putBool("hap", hideListApple); }
         scrollY = 0; velY = 0;
         refreshNow = true;
         drawButtons();
