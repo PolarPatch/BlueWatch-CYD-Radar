@@ -6,154 +6,72 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WiFi.h>
-#include <Wire.h>
 #include <ArduinoJson.h>
-
-#define LGFX_USE_V1
-#include <LovyanGFX.hpp>
 
 #include "config.h"
 #include "logo.h"
+#include "ble_scan.h"
+
+#define FW_VERSION "0.1.0"
 
 // ---------------------------------------------------------------- hardware
+//
+// The display driver, touch driver and pin mapping live in a per-board
+// header (see include/board_*.h), selected by a build flag in
+// platformio.ini (-DBOARD_CYD_2432S028 or -DBOARD_CYD_3248S035C). Both
+// headers provide the same three names: the `tft` object, boardTouchInit()
+// and readTouchBoard(x, y). Both boards are 320 px wide, so only the
+// height-dependent layout constants below differ between them.
 
-class LGFX : public lgfx::LGFX_Device {
-  lgfx::Panel_ST7796 _panel;
-  lgfx::Bus_SPI _bus;
-  lgfx::Light_PWM _light;
-
- public:
-  LGFX() {
-    {
-      auto cfg = _bus.config();
-      cfg.spi_host = SPI2_HOST;
-      cfg.spi_mode = 0;
-      cfg.freq_write = 40000000;
-      cfg.freq_read = 16000000;
-      cfg.spi_3wire = false;
-      cfg.use_lock = true;
-      cfg.dma_channel = SPI_DMA_CH_AUTO;
-      cfg.pin_sclk = 14;
-      cfg.pin_mosi = 13;
-      cfg.pin_miso = 12;
-      cfg.pin_dc = 2;
-      _bus.config(cfg);
-      _panel.setBus(&_bus);
-    }
-    {
-      auto cfg = _panel.config();
-      cfg.pin_cs = 15;
-      cfg.pin_rst = -1;
-      cfg.pin_busy = -1;
-      cfg.memory_width = 320;
-      cfg.memory_height = 480;
-      cfg.panel_width = 320;
-      cfg.panel_height = 480;
-      cfg.offset_x = 0;
-      cfg.offset_y = 0;
-      cfg.offset_rotation = 0;
-      cfg.readable = true;
-      cfg.invert = TFT_INVERT;
-      cfg.rgb_order = false;
-      cfg.dlen_16bit = false;
-      cfg.bus_shared = true;
-      _panel.config(cfg);
-    }
-    {
-      auto cfg = _light.config();
-      cfg.pin_bl = 27;
-      cfg.invert = false;
-      cfg.freq = 44100;
-      cfg.pwm_channel = 7;
-      _light.config(cfg);
-      _panel.setLight(&_light);
-    }
-    setPanel(&_panel);
-  }
-};
-
-static LGFX tft;
-static LGFX_Sprite rowSpr(&tft);
-
-
-// ---------------------------------------------------------------- touch (GT911, read directly)
-
-static const int TP_SDA = 33, TP_SCL = 32, TP_INT = 21, TP_RST = 25;
-static const uint8_t GT911_ADDR = 0x5D;
-
-static void gt911Init() {
-  pinMode(TP_INT, OUTPUT);
-  pinMode(TP_RST, OUTPUT);
-  digitalWrite(TP_INT, HIGH);  // INT high during reset selects address 0x5D
-  digitalWrite(TP_RST, LOW);
-  delay(10);
-  digitalWrite(TP_RST, HIGH);
-  delay(10);
-  pinMode(TP_INT, INPUT);
-  delay(60);
-  Wire1.begin(TP_SDA, TP_SCL, 400000);
-}
-
-static bool gt911Read(int32_t* x, int32_t* y) {
-  Wire1.beginTransmission(GT911_ADDR);
-  Wire1.write(0x81); Wire1.write(0x4E);
-  if (Wire1.endTransmission(false) != 0) return false;
-  if (Wire1.requestFrom((int)GT911_ADDR, 1) != 1) return false;
-  uint8_t status = Wire1.read();
-  bool ready = status & 0x80;
-  int points = status & 0x0F;
-  bool got = false;
-  if (ready && points > 0) {
-    Wire1.beginTransmission(GT911_ADDR);
-    Wire1.write(0x81); Wire1.write(0x50);
-    Wire1.endTransmission(false);
-    if (Wire1.requestFrom((int)GT911_ADDR, 4) == 4) {
-      uint16_t rx = Wire1.read(); rx |= Wire1.read() << 8;
-      uint16_t ry = Wire1.read(); ry |= Wire1.read() << 8;
-      *x = rx; *y = ry;
-      got = true;
-    }
-  }
-  if (ready) {  // acknowledge so the controller reports the next sample
-    Wire1.beginTransmission(GT911_ADDR);
-    Wire1.write(0x81); Wire1.write(0x4E); Wire1.write(0);
-    Wire1.endTransmission();
-  }
-  return got;
-}
-
-// Touch state with a short hold, since the GT911 only reports fresh samples.
-static bool readTouch(int32_t* x, int32_t* y) {
-  static uint32_t lastSeen = 0;
-  static int32_t lx = 0, ly = 0;
-  int32_t tx, ty;
-  if (gt911Read(&tx, &ty)) {
-    lx = tx; ly = ty; lastSeen = millis();
-#if TOUCH_SWAP_XY
-    int32_t t = lx; lx = ly; ly = t;
+// W/SCR_H come from the physical board plus, on the 2432S028, the
+// SCREEN_LANDSCAPE choice in config.h (see board_2432s028.h) -- everything
+// below is then sized off W and SCR_H rather than hardcoded per board, so
+// any width/height combination lays out sensibly: a short screen (a
+// landscape 2432S028) gets the compact single-line header and smaller
+// buttons a tall one doesn't need room for, and the radar's radius fits
+// whichever of width/height is the tighter fit.
+#if defined(BOARD_CYD_2432S028)
+#include "board_2432s028.h"
+#if SCREEN_LANDSCAPE
+static const int W = 320, SCR_H = 240;
+#else
+static const int W = 240, SCR_H = 320;
 #endif
-#if TOUCH_FLIP_X
-    lx = 319 - lx;
+#else
+#include "board_3248s035c.h"
+static const int W = 320, SCR_H = 480;
 #endif
-#if TOUCH_FLIP_Y
-    ly = 479 - ly;
-#endif
-  }
-  if (millis() - lastSeen < 60) { *x = lx; *y = ly; return true; }
-  return false;
-}
 
-// ---------------------------------------------------------------- layout
-
-static const int W = 320;
+#if SCR_H < 300
+static const int HDR_H = 34;
+static const int BTN_Y = 36;
+static const int BTN_H = 22;
+static const int LISTBOX_Y = 62;
+static const int DAREA_Y = 30;
+static const int RBAND_H = 30;
+static const int HDR_LOGO_W = LOGO_SMALL_W, HDR_LOGO_H = LOGO_SMALL_H;
+#define HDR_LOGO_DATA LOGO_SMALL_DATA
+#else
 static const int HDR_H = 62;
 static const int BTN_Y = 64;
 static const int BTN_H = 32;
 static const int LISTBOX_Y = 100;
-static const int LISTBOX_H = 480 - LISTBOX_Y;
+static const int DAREA_Y = 44;
+static const int RBAND_H = 40;
+static const int HDR_LOGO_W = LOGO_W, HDR_LOGO_H = LOGO_H;
+#define HDR_LOGO_DATA LOGO_DATA
+#endif
+static const int LISTBOX_H = SCR_H - LISTBOX_Y;
+static const int DAREA_H = SCR_H - DAREA_Y;
+// Outer ring 1-2 px from whichever of width/height is the tighter fit.
+static const float RADAR_MAXR = (min(W, DAREA_H) - 2) / 2.0f;
+
+static LGFX_Sprite rowSpr(&tft);
+static bool readTouch(int32_t* x, int32_t* y) { return readTouchBoard(x, y); }
+
+// ---------------------------------------------------------------- layout
+
 static const int ROW_H = 26;
-static const int DAREA_Y = 44;  // content area below the bar in detail and radar views
-static const int DAREA_H = 480 - DAREA_Y;
 
 static const uint16_t C_BG = 0x0882;      // near black (13,17,23)
 static const uint16_t C_ROW_A = 0x0882;
@@ -182,6 +100,8 @@ static volatile uint32_t dataVersion = 0;
 static volatile uint32_t lastOkMs = 0;
 static volatile bool fetchFailed = false;
 static volatile bool refreshNow = false;
+static volatile bool localMode = false;   // true = showing the board's own BLE scan, not BlueWatch
+static volatile int consecFails = 0;
 
 struct Detail {
   char m[20], n[32], v[32], ty[24], g[24], nt[84], fs[16], ls[16], px[12];
@@ -212,9 +132,9 @@ static int rcounts[2] = {0, 0};
 static volatile int rFront = 0;
 static volatile uint32_t rVersion = 0;
 static volatile bool radarWanted = false;
-static const float RADAR_MAXR = 159.0f;  // outer ring sits 1 px from the screen edges
 
 static bool hideClassified = true, hideGrouped = true, hideUnknown = true;
+static bool hideRadarClassified = false, hideRadarGrouped = false, hideRadarUnknown = false, hideRadarApple = false;
 static Preferences prefs;
 
 static uint16_t typeColor(const char* t) {
@@ -241,8 +161,153 @@ static void formatAge(uint32_t s, char* out, size_t n) {
   else snprintf(out, n, "%ud", (unsigned)(s / 86400));
 }
 
+// A short, honest label for the lite classifier's type keys -- distinct
+// from typeColor()'s palette lookup, used as the Device Details subtitle
+// in standalone mode (BlueWatch's own get_type_label() does this
+// server-side; there's no equivalent data on the board, so this is a
+// small fixed table covering the types classifyLite() can produce).
+static const char* typeLabelLite(const char* t) {
+  auto is = [&](const char* s) { return strcmp(t, s) == 0; };
+  if (is("tracker")) return "Tracker";
+  if (is("flipper")) return "Flipper Zero";
+  if (is("wearable")) return "Wearable";
+  if (is("audio")) return "Audio";
+  if (is("drone")) return "Drone (Remote ID)";
+  return "Unknown";
+}
+
+static const char* proximityLite(int16_t rssi) {
+  if (rssi >= -50) return "close";
+  if (rssi >= -70) return "near";
+  if (rssi >= -85) return "medium";
+  return "remote";
+}
+
+static uint32_t fnv1a(const char* s) {
+  uint32_t h = 2166136261u;
+  for (const char* c = s; *c; c++) { h ^= (uint8_t)*c; h *= 16777619u; }
+  return h;
+}
+
+// Same angle rule as the server's radar and BlueWatch's own web /radar page
+// (an FNV-1a hash of the MAC's text form), so a given device sits at the
+// same spot whichever data source is behind it.
+static float hashAngle(const char* mac) {
+  return (fnv1a(mac) / 4294967296.0f) * 6.2831853f;
+}
+
+#ifdef DEMO_MODE
+// Same idea (and the same name pool) as the web dashboard's own demo mode
+// (?demo=1 -- see templates.py's DEMO_NAMES): every real name becomes a
+// generic placeholder, picked from the MAC so the same device keeps the
+// same fake name across the list, the radar and a refresh. For safe
+// screenshots/photos -- nothing else about the data changes.
+static const char* DEMO_NAMES[] = {
+  "Guest Phone", "Kitchen Speaker", "Smart Plug", "Wireless Headset", "Fitness Tracker",
+  "Smart TV", "Tablet", "Car Bluetooth", "IoT Sensor", "Robot Vacuum",
+  "Doorbell Camera", "Smart Watch", "Bluetooth Mouse", "Game Controller", "E-bike Lock",
+};
+static const int DEMO_NAME_COUNT = sizeof(DEMO_NAMES) / sizeof(DEMO_NAMES[0]);
+static const char* demoNameFor(const char* mac) { return DEMO_NAMES[fnv1a(mac) % DEMO_NAME_COUNT]; }
+#endif
+
+// ---------------------------------------------------------------- standalone (local BLE scan)
+//
+// Fills the exact same bufs[]/dets[]/rdots[] buffers the server path below
+// fills, from the board's own scan table (see ble_scan.h) instead of a
+// BlueWatch HTTP response -- so every drawing function downstream works
+// unchanged no matter which source is behind the data. See the README for
+// what standalone mode can't do that a real BlueWatch server can (no
+// multi-day history, no vendor names, no categories or alerts).
+
+static int bleCompareLastSeen(const void* a, const void* b) {
+  const BleEntry* ea = (const BleEntry*)a;
+  const BleEntry* eb = (const BleEntry*)b;
+  return (int)(eb->lastSeenMs - ea->lastSeenMs);
+}
+
+static void buildListLocal() {
+  static BleEntry snap[MAX_ROWS > 150 ? MAX_ROWS : 150];
+  int n = bleScanSnapshot(snap, sizeof(snap) / sizeof(snap[0]));
+  qsort(snap, n, sizeof(BleEntry), bleCompareLastSeen);
+
+  int back = 1 - frontIdx;
+  int out = 0;
+  uint32_t now = millis();
+  for (int i = 0; i < n && out < MAX_ROWS; i++) {
+    const BleEntry& e = snap[i];
+    bool unknown = e.name[0] == 0 && strcmp(e.type, "unknown") == 0;
+    if (hideUnknown && unknown) continue;
+    // hideClassified/hideGrouped have no local equivalent (no categories
+    // without a server) -- both are no-ops in standalone mode.
+    uint32_t ageSec = (now - e.lastSeenMs) / 1000;
+    if (ageSec > (uint32_t)LIST_WINDOW_SECONDS) continue;
+    Row& r = bufs[back][out++];
+    macToStr(e.mac, r.m, sizeof(r.m));
+    if (e.name[0]) strlcpy(r.n, e.name, sizeof(r.n));
+    else snprintf(r.n, sizeof(r.n), "BLE %02X:%02X", e.mac[4], e.mac[5]);
+#ifdef DEMO_MODE
+    strlcpy(r.n, demoNameFor(r.m), sizeof(r.n));
+#endif
+    strlcpy(r.t, e.type, sizeof(r.t));
+    r.r = e.rssi;
+    r.a = ageSec;
+    r.w = 0;
+    r.l = 0;
+  }
+  counts[back] = out;
+  totals[back] = out;
+  frontIdx = back;
+  dataVersion++;
+  lastOkMs = millis();
+  fetchFailed = false;
+}
+
+static void buildDetailLocal() {
+  uint8_t mac[6];
+  if (!strToMac(detailMac, mac)) return;
+  BleEntry e;
+  if (!bleScanFind(mac, &e)) return;  // not seen (yet, or evicted) -- leave the "loading" state
+
+  int back = 1 - detFront;
+  Detail& d = dets[back];
+  memset(&d, 0, sizeof(d));
+  strlcpy(d.m, detailMac, sizeof(d.m));
+  strlcpy(d.n, e.name, sizeof(d.n));
+#ifdef DEMO_MODE
+  strlcpy(d.n, demoNameFor(detailMac), sizeof(d.n));
+  strlcpy(d.m, "00:00:00:00:00:00", sizeof(d.m));
+#endif
+  strlcpy(d.ty, typeLabelLite(e.type), sizeof(d.ty));
+  strlcpy(d.px, proximityLite(e.rssi), sizeof(d.px));
+  uint32_t now = millis();
+  char buf[16];
+  formatAge((now - e.firstSeenMs) / 1000, buf, sizeof(buf));
+  snprintf(d.fs, sizeof(d.fs), "%s ago", buf);
+  formatAge((now - e.lastSeenMs) / 1000, buf, sizeof(buf));
+  snprintf(d.ls, sizeof(d.ls), "%s ago", buf);
+  d.sg = e.sightings;
+  d.rs = e.rssi;
+  d.w = 0;
+  // The ring holds only the last few samples (no timed buckets like the
+  // server's 15-minute grid) -- placed at the end of the 60-slot live
+  // array so they read as "just now" on the chart; hist[] stays all zero,
+  // there is no persistent history without a server, and the chart says so.
+  int ringLen = sizeof(e.liveRing) / sizeof(e.liveRing[0]);
+  for (int i = 0; i < ringLen; i++) {
+    int8_t v = e.liveRing[(e.liveHead + i) % ringLen];
+    if (v != 0) d.live[60 - ringLen + i] = v;
+  }
+
+  if (detailWanted && strcmp(d.m, detailMac) == 0) {
+    detFront = back;
+    detLoaded = true;
+    detVersion++;
+  }
+}
+
 static void fetchList() {
-  String url = String("http://") + BW_HOST + ":" + BW_PORT + "/api/display?limit=100";
+  String url = String("http://") + BW_HOST + ":" + BW_PORT + "/api/display?limit=100&active_within=" + String((unsigned long)LIST_WINDOW_SECONDS);
   if (hideClassified) url += "&hide_classified=1";
   if (hideGrouped) url += "&hide_grouped=1";
   if (hideUnknown) url += "&hide_nameless=1";
@@ -262,6 +327,9 @@ static void fetchList() {
         Row& r = bufs[back][n++];
         strlcpy(r.m, o["m"] | "", sizeof(r.m));
         strlcpy(r.n, o["n"] | "?", sizeof(r.n));
+#ifdef DEMO_MODE
+        strlcpy(r.n, demoNameFor(r.m), sizeof(r.n));
+#endif
         strlcpy(r.t, o["t"] | "unknown", sizeof(r.t));
         r.r = o["r"] | 0;
         r.a = o["a"] | 0;
@@ -298,6 +366,10 @@ static void fetchDetail() {
       memset(&d, 0, sizeof(d));
       strlcpy(d.m, doc["m"] | "", sizeof(d.m));
       strlcpy(d.n, doc["n"] | "", sizeof(d.n));
+#ifdef DEMO_MODE
+      strlcpy(d.n, demoNameFor(d.m), sizeof(d.n));
+      strlcpy(d.m, "00:00:00:00:00:00", sizeof(d.m));
+#endif
       strlcpy(d.v, doc["v"] | "", sizeof(d.v));
       strlcpy(d.ty, doc["ty"] | "", sizeof(d.ty));
       strlcpy(d.g, doc["g"] | "", sizeof(d.g));
@@ -372,8 +444,49 @@ static void placeLabels(RDot* dots, int n) {
   }
 }
 
+static void buildRadarLocal() {
+  static BleEntry snap[MAX_DOTS];
+  int n = bleScanSnapshot(snap, MAX_DOTS);
+
+  int back = 1 - rFront;
+  int out = 0;
+  for (int i = 0; i < n; i++) {
+    const BleEntry& e = snap[i];
+    // hideRadarGrouped has no local equivalent (no categories without a
+    // server) and is always a no-op in standalone mode.
+    if (hideRadarClassified && strcmp(e.type, "unknown") != 0) continue;
+    if (hideRadarUnknown && e.name[0] == 0 && strcmp(e.type, "unknown") == 0) continue;
+    if (hideRadarApple && e.isApple) continue;
+    char macStr[18];
+    macToStr(e.mac, macStr, sizeof(macStr));
+    float t = (-30.0f - (float)e.rssi) / 70.0f;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    RDot& d = rdots[back][out++];
+    d.ang = hashAngle(macStr);
+    d.rad = RADAR_MAXR * (0.12f + t * 0.88f);
+    d.col = typeColor(e.type);
+    d.alert = 0;
+    d.watched = 0;
+    d.rssi = e.rssi;
+    strlcpy(d.lab, e.name, sizeof(d.lab));
+#ifdef DEMO_MODE
+    strlcpy(d.lab, demoNameFor(macStr), sizeof(d.lab));
+#endif
+    d.lx = d.ly = 0;
+  }
+  placeLabels(rdots[back], out);
+  rcounts[back] = out;
+  rFront = back;
+  rVersion++;
+}
+
 static void fetchRadar() {
   String url = String("http://") + BW_HOST + ":" + BW_PORT + "/api/display/radar?window=300";
+  if (hideRadarClassified) url += "&hide_classified=1";
+  if (hideRadarGrouped) url += "&hide_grouped=1";
+  if (hideRadarUnknown) url += "&hide_nameless=1";
+  if (hideRadarApple) url += "&hide_apple=1";
   HTTPClient http;
   http.setTimeout(8000);
   http.begin(url);
@@ -401,6 +514,9 @@ static void fetchRadar() {
         d.watched = o["w"] | 0;
         d.rssi = o["r"] | -100;
         strlcpy(d.lab, o["n"] | "", sizeof(d.lab));
+#ifdef DEMO_MODE
+        strlcpy(d.lab, demoNameFor(mac), sizeof(d.lab));
+#endif
         d.lx = d.ly = 0;
       }
       placeLabels(rdots[back], n);
@@ -416,16 +532,43 @@ static void fetchRadar() {
 
 // Runs on core 0: keeps Wi-Fi up and fetches data, never blocks the UI.
 static void fetchTask(void*) {
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  // Leave WIFI_SSID empty in config.h to skip Wi-Fi/BlueWatch entirely and
+  // run standalone-only from boot -- no connection attempts, no retries.
+#ifdef FORCE_STANDALONE
+  // Test build (see the *-standalone-test env in platformio.ini): never
+  // touch Wi-Fi or BlueWatch, only the board's own BLE scan, regardless of
+  // what config.h says.
+  bool haveWifi = false;
+#else
+  bool haveWifi = WIFI_SSID[0] != 0;
+#endif
+  if (haveWifi) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  } else {
+    localMode = true;
+  }
   for (;;) {
-    if (WiFi.status() == WL_CONNECTED) {
+    if (haveWifi && WiFi.status() == WL_CONNECTED) {
       if (radarWanted) fetchRadar();
       else if (detailWanted) fetchDetail();
       else fetchList();
-    } else {
+    } else if (haveWifi) {
       fetchFailed = true;
+    }
+    if (haveWifi) {
+      // A few misses in a row (server down, wrong BW_HOST, first boot
+      // before BlueWatch starts) fall back to the board's own scan rather
+      // than sitting on a stale or empty screen -- and a later success
+      // switches straight back, so this recovers on its own either way.
+      if (fetchFailed) { consecFails++; if (consecFails >= 3) localMode = true; }
+      else { consecFails = 0; localMode = false; }
+    }
+    if (localMode) {
+      if (radarWanted) buildRadarLocal();
+      else if (detailWanted) buildDetailLocal();
+      else buildListLocal();
     }
     for (int i = 0; i < REFRESH_MS / 100 && !refreshNow; i++) vTaskDelay(pdMS_TO_TICKS(100));
     refreshNow = false;
@@ -436,9 +579,51 @@ static void fetchTask(void*) {
 
 static float scrollY = 0, velY = 0;
 
+// Status text: what the header's second (or right-hand, compact layout)
+// line says, and its colour -- shared between the compact and roomy header
+// layouts below.
+static void headerStatus(char* line, size_t lineSz, uint16_t* color) {
+  if (WIFI_SSID[0] != 0 && WiFi.status() != WL_CONNECTED) {
+    snprintf(line, lineSz, "connecting to Wi-Fi...");
+    *color = colGold;
+  } else if (localMode) {
+    snprintf(line, lineSz, "%d devices (local scan)", bleScanTotal());
+    *color = colGold;
+  } else if (lastOkMs == 0) {
+    snprintf(line, lineSz, "loading...");
+    *color = C_MUTED;
+  } else if (fetchFailed) {
+    snprintf(line, lineSz, "no answer from BlueWatch");
+    *color = colAlert;
+  } else {
+    snprintf(line, lineSz, "%d devices", totals[frontIdx]);
+    *color = C_MUTED;
+  }
+}
+
 static void drawHeader() {
   tft.fillRect(0, 0, W, HDR_H, C_BG);
-  tft.pushImage(4, 3, LOGO_W, LOGO_H, (const lgfx::rgb565_t*)LOGO_DATA);
+  tft.pushImage(4, (HDR_H - HDR_LOGO_H) / 2, HDR_LOGO_W, HDR_LOGO_H, (const lgfx::rgb565_t*)HDR_LOGO_DATA);
+  char line[48];
+  uint16_t color;
+  headerStatus(line, sizeof(line), &color);
+
+  if (HDR_H < 50) {
+    // Compact single-line header for the smaller/shorter board: logo,
+    // "BlueWatch", status right-aligned, all on one row.
+    tft.setFont(&fonts::Font2);
+    tft.setTextDatum(middle_left);
+    tft.setTextColor(colAccent, C_BG);
+    tft.drawString("Blue", HDR_LOGO_W + 8, HDR_H / 2);
+    int bw = tft.textWidth("Blue");
+    tft.setTextColor(TFT_WHITE, C_BG);
+    tft.drawString("Watch", HDR_LOGO_W + 8 + bw, HDR_H / 2);
+    tft.setTextDatum(middle_right);
+    tft.setTextColor(color, C_BG);
+    tft.drawString(line, W - 4, HDR_H / 2);
+    return;
+  }
+
   tft.setFont(&fonts::Font4);
   tft.setTextDatum(top_left);
   tft.setTextColor(colAccent, C_BG);
@@ -448,21 +633,15 @@ static void drawHeader() {
   tft.drawString("Watch", 68 + bw, 6);
 
   tft.setFont(&fonts::Font2);
-  char line[48];
-  if (WiFi.status() != WL_CONNECTED) {
-    snprintf(line, sizeof(line), "connecting to Wi-Fi...");
-    tft.setTextColor(colGold, C_BG);
-  } else if (lastOkMs == 0) {
-    snprintf(line, sizeof(line), "loading...");
-    tft.setTextColor(C_MUTED, C_BG);
-  } else if (fetchFailed) {
-    snprintf(line, sizeof(line), "no answer from BlueWatch");
-    tft.setTextColor(colAlert, C_BG);
-  } else {
-    snprintf(line, sizeof(line), "%d devices", totals[frontIdx]);
-    tft.setTextColor(C_MUTED, C_BG);
-  }
+  tft.setTextColor(color, C_BG);
   tft.drawString(line, 70, 38);
+}
+
+static const int LBTN_X0 = 42, LBTN_GAP = 4;
+static const int LBTN_W = (W - LBTN_X0 - 4 - 2 * LBTN_GAP) / 3;
+static void listBtnRect(int i, int* x, int* w) {
+  *x = LBTN_X0 + i * (LBTN_W + LBTN_GAP);
+  *w = LBTN_W;
 }
 
 static void drawButtons() {
@@ -474,9 +653,10 @@ static void drawButtons() {
   tft.drawString("Hide", 6, BTN_Y + BTN_H / 2);
   const char* labels[3] = {"classified", "grouped", "unknowns"};
   bool on[3] = {hideClassified, hideGrouped, hideUnknown};
-  const int x0 = 42, bw = 88, gap = 4;
+  if (W < 300) tft.setFont(&fonts::Font0);  // narrower board: the full words need a smaller font to fit
   for (int i = 0; i < 3; i++) {
-    int x = x0 + i * (bw + gap);
+    int x, bw;
+    listBtnRect(i, &x, &bw);
     if (on[i]) {
       tft.fillRoundRect(x, BTN_Y, bw, BTN_H, 6, colAccent);
       tft.setTextColor(TFT_WHITE, colAccent);
@@ -504,7 +684,7 @@ static void renderRow(const Row* r, int idx) {
   // name, truncated to fit before the age column
   char name[32];
   strlcpy(name, r->n, sizeof(name));
-  const int maxW = 196;
+  const int maxW = W - 124;
   rowSpr.setTextColor(r->l ? colAlert : C_TEXT, bg);
   while (strlen(name) > 1 && rowSpr.textWidth(name) > maxW) name[strlen(name) - 1] = 0;
   rowSpr.drawString(name, 28, ROW_H / 2);
@@ -513,7 +693,7 @@ static void renderRow(const Row* r, int idx) {
   formatAge(r->a, age, sizeof(age));
   rowSpr.setTextDatum(middle_right);
   rowSpr.setTextColor(C_MUTED, bg);
-  rowSpr.drawString(age, 270, ROW_H / 2);
+  rowSpr.drawString(age, W - 50, ROW_H / 2);
 
   char rssi[8];
   snprintf(rssi, sizeof(rssi), "%d", r->r);
@@ -557,14 +737,14 @@ static int dbmY(int top, int h, int dbm) {
 }
 
 static void chartBox(LGFX_Sprite& sp, int yo, int top, int h) {
-  sp.fillRoundRect(10, top - yo, 300, h, 6, C_ROW_B);
+  sp.fillRoundRect(10, top - yo, W - 20, h, 6, C_ROW_B);
   sp.setFont(&fonts::Font0);
   sp.setTextColor(C_MUTED, C_ROW_B);
   sp.setTextDatum(middle_left);
   const int levels[3] = {-40, -60, -80};
   for (int i = 0; i < 3; i++) {
     int y = dbmY(top, h, levels[i]) - yo;
-    sp.drawFastHLine(34, y, 268, C_GRID);
+    sp.drawFastHLine(34, y, W - 52, C_GRID);
     char lb[8];
     snprintf(lb, sizeof(lb), "%d", levels[i]);
     sp.drawString(lb, 14, y);
@@ -581,7 +761,7 @@ static void drawDetailContent(LGFX_Sprite& sp, int yo, const Detail& d) {
   sp.setTextColor(C_TEXT, C_BG);
   char title[40];
   strlcpy(title, d.n[0] ? d.n : (d.v[0] ? d.v : d.m), sizeof(title));
-  while (strlen(title) > 1 && sp.textWidth(title) > 300) title[strlen(title) - 1] = 0;
+  while (strlen(title) > 1 && sp.textWidth(title) > W - 20) title[strlen(title) - 1] = 0;
   sp.drawString(title, 10, 8 - yo);
   sp.setFont(&fonts::Font2);
   sp.setTextColor(C_MUTED, C_BG);
@@ -607,8 +787,8 @@ static void drawDetailContent(LGFX_Sprite& sp, int yo, const Detail& d) {
     sp.setTextColor(C_TEXT, (i & 1) ? C_ROW_B : C_BG);
     char v[40];
     strlcpy(v, values[i], sizeof(v));
-    while (strlen(v) > 1 && sp.textWidth(v) > 210) v[strlen(v) - 1] = 0;
-    sp.drawString(v, 310, y + 6);
+    while (strlen(v) > 1 && sp.textWidth(v) > W - 130) v[strlen(v) - 1] = 0;
+    sp.drawString(v, W - 10, y + 6);
   }
 
   // Live Signal
@@ -623,7 +803,7 @@ static void drawDetailContent(LGFX_Sprite& sp, int yo, const Detail& d) {
   for (int i = 0; i < 60; i++) {
     if (d.live[i] == 0) { prevX = -1; continue; }
     any = true;
-    int x = 36 + (int)(i * 4.5f), y = dbmY(lTop, cH, d.live[i]);
+    int x = 36 + (int)(i * (W - 56) / 59.0f), y = dbmY(lTop, cH, d.live[i]);
     if (prevX >= 0) sp.drawLine(prevX, prevY - yo, x, y - yo, C_TEXT);
     sp.fillCircle(x, y - yo, 1, C_TEXT);
     prevX = x; prevY = y; lastX = x; lastY = y;
@@ -632,7 +812,7 @@ static void drawDetailContent(LGFX_Sprite& sp, int yo, const Detail& d) {
   else {
     sp.setTextDatum(middle_center);
     sp.setTextColor(C_MUTED, C_ROW_B);
-    sp.drawString("no signal in the last 15 min", 160, lTop + cH / 2 - yo);
+    sp.drawString("no signal in the last 15 min", W / 2, lTop + cH / 2 - yo);
   }
 
   // Signal History
@@ -647,7 +827,7 @@ static void drawDetailContent(LGFX_Sprite& sp, int yo, const Detail& d) {
   int px = -1, py = 0;
   for (int i = 0; i < hn; i++) {
     hAny = true;
-    int x = hn == 1 ? 170 : 36 + (int)(i * 268.0f / (hn - 1));
+    int x = hn == 1 ? W / 2 : 36 + (int)(i * (W - 56) / (float)(hn - 1));
     int y1 = dbmY(hTop, cH, d.hmax[i]), y2 = dbmY(hTop, cH, d.hmin[i]);
     int ym = (y1 + y2) / 2;
     if (px >= 0) sp.drawLine(px, py - yo, x, ym - yo, C_TEXT);
@@ -657,7 +837,7 @@ static void drawDetailContent(LGFX_Sprite& sp, int yo, const Detail& d) {
   if (!hAny) {
     sp.setTextDatum(middle_center);
     sp.setTextColor(C_MUTED, C_ROW_B);
-    sp.drawString("not enough data", 160, hTop + cH / 2 - yo);
+    sp.drawString("not enough data", W / 2, hTop + cH / 2 - yo);
   }
 }
 
@@ -703,7 +883,6 @@ static void drawDetail() {
 
 static LGFX_Sprite radSpr(&tft);
 static bool radarMode = false;
-static const int RBAND_H = 40;
 
 static uint16_t mix565(uint16_t a, uint16_t b, float t) {
   if (t < 0) t = 0;
@@ -713,19 +892,45 @@ static uint16_t mix565(uint16_t a, uint16_t b, float t) {
   return (uint16_t)((((int)(ar + (br - ar) * t)) << 11) | (((int)(ag + (bg - ag) * t)) << 5) | (int)(ab + (bb - ab) * t));
 }
 
+// Back button + four filter toggles (Cls/Grp/Unk/Apl), all in the one bar
+// above the radar -- there's no room here for both this and a device
+// count, and the toggles are more useful to have visible at a glance.
+static const int RBACK_W = HDR_H < 50 ? 40 : 68;
+static const int RBAR_BTN_H = DAREA_Y - 6;
+static const int RCHIP_X0 = RBACK_W + 8;
+static const int RCHIP_GAP = 3;
+static const int RCHIP_W = (W - RCHIP_X0 - 4 - 3 * RCHIP_GAP) / 4;
+
+static void radarChipRect(int i, int* x, int* w) {
+  *x = RCHIP_X0 + i * (RCHIP_W + RCHIP_GAP);
+  *w = RCHIP_W;
+}
+
 static void drawRadarBar() {
   tft.fillRect(0, 0, W, DAREA_Y, C_BG);
-  tft.fillRoundRect(6, 6, 76, 32, 6, C_ROW_B);
-  tft.drawRoundRect(6, 6, 76, 32, 6, C_MUTED);
-  tft.setFont(&fonts::Font2);
+  tft.fillRoundRect(4, 3, RBACK_W, RBAR_BTN_H, 5, C_ROW_B);
+  tft.drawRoundRect(4, 3, RBACK_W, RBAR_BTN_H, 5, C_MUTED);
+  if (HDR_H < 50) tft.setFont(&fonts::Font0);
+  else tft.setFont(&fonts::Font2);
   tft.setTextDatum(middle_center);
   tft.setTextColor(C_TEXT, C_ROW_B);
-  tft.drawString("< Back", 44, 22);
-  tft.setTextDatum(middle_left);
-  tft.setTextColor(C_MUTED, C_BG);
-  char line[32];
-  snprintf(line, sizeof(line), "Radar  -  %d on air", rcounts[rFront]);
-  tft.drawString(line, 96, 22);
+  tft.drawString("< Back", 4 + RBACK_W / 2, 3 + RBAR_BTN_H / 2);
+
+  const char* labels[4] = {"Cls", "Grp", "Unk", "Apl"};
+  bool on[4] = {hideRadarClassified, hideRadarGrouped, hideRadarUnknown, hideRadarApple};
+  for (int i = 0; i < 4; i++) {
+    int x, w;
+    radarChipRect(i, &x, &w);
+    if (on[i]) {
+      tft.fillRoundRect(x, 3, w, RBAR_BTN_H, 5, colAccent);
+      tft.setTextColor(TFT_WHITE, colAccent);
+    } else {
+      tft.fillRoundRect(x, 3, w, RBAR_BTN_H, 5, C_ROW_B);
+      tft.drawRoundRect(x, 3, w, RBAR_BTN_H, 5, C_MUTED);
+      tft.setTextColor(C_MUTED, C_ROW_B);
+    }
+    tft.drawString(labels[i], x + w / 2, 3 + RBAR_BTN_H / 2);
+  }
 }
 
 static void drawRadarBand(int y0, float sweep) {
@@ -813,10 +1018,15 @@ static void drawRadar() {
 
 void setup() {
   Serial.begin(115200);
+  Serial.printf("BlueWatch CYD Radar v%s\n", FW_VERSION);
   prefs.begin("bwdisp", false);
   hideClassified = prefs.getBool("hc", true);
   hideGrouped = prefs.getBool("hg", true);
   hideUnknown = prefs.getBool("hu", true);
+  hideRadarClassified = prefs.getBool("rc", false);
+  hideRadarGrouped = prefs.getBool("rg", false);
+  hideRadarUnknown = prefs.getBool("ru", false);
+  hideRadarApple = prefs.getBool("ra", false);
 
   tft.init();
   tft.setRotation(TFT_ROTATION);
@@ -827,7 +1037,7 @@ void setup() {
   colGold = tft.color565(230, 170, 60);
   colGood = tft.color565(63, 185, 80);
 
-  gt911Init();
+  boardTouchInit();
 
   rowSpr.setColorDepth(16);
   rowSpr.createSprite(W, ROW_H);
@@ -838,7 +1048,13 @@ void setup() {
   drawButtons();
   drawList();
 
-  xTaskCreatePinnedToCore(fetchTask, "fetch", 12288, nullptr, 1, nullptr, 0);
+  bleScanStart();
+
+  // Core 0 already carries the Wi-Fi driver and NimBLE's host/controller
+  // tasks -- adding this one too was enough to starve its idle task and
+  // trip the watchdog in a BLE-dense area. Core 1 (where loop() runs) has
+  // headroom to spare.
+  xTaskCreatePinnedToCore(fetchTask, "fetch", 12288, nullptr, 1, nullptr, 1);
 }
 
 void loop() {
@@ -886,7 +1102,7 @@ void loop() {
     }
   } else if (wasTouch && !moved && !longFired) {
     if (radarMode) {
-      if (startY < DAREA_Y && startX < 100) {  // Back
+      if (startY < DAREA_Y && startX < RBACK_W + 8) {  // Back
         radarMode = false;
         radarWanted = false;
         refreshNow = true;
@@ -894,6 +1110,21 @@ void loop() {
         drawHeader();
         drawButtons();
         dirty = true;
+      } else if (startY < DAREA_Y) {
+        for (int i = 0; i < 4; i++) {
+          int x, w;
+          radarChipRect(i, &x, &w);
+          if (startX >= x && startX < x + w) {
+            if (i == 0) { hideRadarClassified = !hideRadarClassified; prefs.putBool("rc", hideRadarClassified); }
+            if (i == 1) { hideRadarGrouped = !hideRadarGrouped; prefs.putBool("rg", hideRadarGrouped); }
+            if (i == 2) { hideRadarUnknown = !hideRadarUnknown; prefs.putBool("ru", hideRadarUnknown); }
+            if (i == 3) { hideRadarApple = !hideRadarApple; prefs.putBool("ra", hideRadarApple); }
+            refreshNow = true;
+            drawRadarBar();
+            dirty = true;
+            break;
+          }
+        }
       }
     } else if (!detailMode && startY < HDR_H && startX < 64) {  // logo -> radar
       radarMode = true;
@@ -912,9 +1143,8 @@ void loop() {
         dirty = true;
       }
     } else if (startY >= BTN_Y && startY < BTN_Y + BTN_H) {
-      const int x0 = 42, bw = 88, gap = 4;
-      int i = (startX - x0) / (bw + gap);
-      if (startX >= x0 && i >= 0 && i < 3 && (startX - x0) % (bw + gap) < bw) {
+      int i = (startX - LBTN_X0) / (LBTN_W + LBTN_GAP);
+      if (startX >= LBTN_X0 && i >= 0 && i < 3 && (startX - LBTN_X0) % (LBTN_W + LBTN_GAP) < LBTN_W) {
         if (i == 0) { hideClassified = !hideClassified; prefs.putBool("hc", hideClassified); }
         if (i == 1) { hideGrouped = !hideGrouped; prefs.putBool("hg", hideGrouped); }
         if (i == 2) { hideUnknown = !hideUnknown; prefs.putBool("hu", hideUnknown); }
@@ -947,11 +1177,16 @@ void loop() {
   if (detVersion != seenDetVersion) { seenDetVersion = detVersion; dirty = true; }
 
   if (!detailMode) {
-    // The header only changes with the connection state or the device count.
-    int state = WiFi.status() != WL_CONNECTED ? 0 : (lastOkMs == 0 ? 1 : (fetchFailed ? 2 : 3));
-    if (state != lastState || totals[frontIdx] != lastTotal) {
+    // The header only changes with the connection state, localMode (server
+    // vs. standalone), or the device count -- localMode used to be left out
+    // here, so a switch back to the server after a brief hiccup left the
+    // header frozen on "local scan" even though the list itself (which
+    // redraws on dataVersion, not this) was already showing real data again.
+    int state = (WiFi.status() != WL_CONNECTED ? 0 : (lastOkMs == 0 ? 1 : (fetchFailed ? 2 : 3))) * 2 + (localMode ? 1 : 0);
+    int shownTotal = localMode ? bleScanTotal() : totals[frontIdx];
+    if (state != lastState || shownTotal != lastTotal) {
       lastState = state;
-      lastTotal = totals[frontIdx];
+      lastTotal = shownTotal;
       drawHeader();
     }
   }
